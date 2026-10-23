@@ -25,8 +25,6 @@ OrchestratorAgent creates state at start, each routing tool reads and
 updates it after the worker responds.
 """
 
-import io
-import zipfile
 import boto3
 import json
 import time
@@ -81,7 +79,7 @@ from agent_utils import (
 # Use it exactly like `strands.tool`:  @tool  above each tool function.
 from agent_observability import (
     tool, tracer, setup_logging, flush_logs, print_trace_hint,
-    apply_observability_config, wait_for_runtime_ready, enable_transaction_search,
+    apply_observability_config, wait_for_runtime_ready,
 )
 
 
@@ -93,7 +91,30 @@ bedrock_runtime      = boto3.client('bedrock-runtime', region_name=config.AWS_RE
 agentcore_client     = boto3.client('bedrock-agentcore', region_name=config.AWS_REGION)
 agentcore_control    = boto3.client('bedrock-agentcore-control', region_name=config.AWS_REGION)
 dynamodb             = boto3.resource('dynamodb', region_name=config.AWS_REGION)
-logs_client          = boto3.client('logs', region_name=config.AWS_REGION)
+
+
+# ─────────────────────────────────────────────────────
+# GUARDRAIL ATTACHMENT
+# ─────────────────────────────────────────────────────
+# AgentCore Runtime has no guardrail parameter: guardrails are enforced per
+# model call. Every agent model is therefore configured with the same
+# published guardrail whenever its ID and version are known (from .env locally
+# or from the runtime environment variables after deployment).
+def _apply_guardrail(model: BedrockModel) -> BedrockModel:
+    """Attach the configured Bedrock Guardrail to an agent's model."""
+    guardrail_id      = getattr(config, 'GUARDRAIL_ID', '') or os.environ.get('GUARDRAIL_ID', '')
+    guardrail_version = getattr(config, 'GUARDRAIL_VERSION', '') or os.environ.get('GUARDRAIL_VERSION', '')
+
+    if guardrail_id and guardrail_version:
+        model.update_config(
+            guardrail_id=guardrail_id,
+            guardrail_version=guardrail_version,
+        )
+        logger.info(
+            "Guardrail attached: %s (version %s)", guardrail_id, guardrail_version
+        )
+
+    return model
 
 
 # ═══════════════════════════════════════════════════════
@@ -215,11 +236,11 @@ def build_inventory_agent() -> Agent:
     only retrieves data for the OrchestratorAgent to share with downstream agents.
     """
 
-    model = BedrockModel(
+    model = _apply_guardrail(BedrockModel(
         model_id=config.WORKER_MODEL_ID, 
         region_name=config.AWS_REGION, 
         temperature=0.1
-    )
+    ))
 
     system_prompt = """
     # Role and Identity
@@ -436,11 +457,11 @@ def build_refund_agent() -> Agent:
     WorkflowState and applies the correct policy window per customer tier.
     """
 
-    model = BedrockModel(
+    model = _apply_guardrail(BedrockModel(
         model_id=config.WORKER_MODEL_ID, 
         region_name=config.AWS_REGION, 
         temperature=0.1
-    )
+    ))
 
     system_prompt = """
     # Role and Identity
@@ -719,11 +740,11 @@ def build_policy_agent() -> Agent:
     the combined results into a complete, grounded policy answer.
     """
 
-    model = BedrockModel(
+    model = _apply_guardrail(BedrockModel(
         model_id=config.WORKER_MODEL_ID,
         region_name=config.AWS_REGION,
         temperature=0.0,
-    )
+    ))
 
     policy_retriever_prompt_template = """
     You are the {agent_name} for NovaMart.
@@ -906,11 +927,11 @@ def build_policy_agent() -> Agent:
             f"Combined policy retrieval for: {query}\n\n" + "\n\n".join(sections)
         )
 
-    coordinator_model = BedrockModel(
+    coordinator_model = _apply_guardrail(BedrockModel(
         model_id=config.WORKER_MODEL_ID,
         region_name=config.AWS_REGION,
         temperature=0.2,
-    )
+    ))
 
     policy_coordinator_system_prompt = """
     You are the PolicyCoordinatorAgent for NovaMart customer support.
@@ -1061,11 +1082,11 @@ def build_communication_agent() -> Agent:
     and composing a coherent, empathetic response.
     """
 
-    model = BedrockModel(
+    model = _apply_guardrail(BedrockModel(
         model_id=config.WORKER_MODEL_ID,
         region_name=config.AWS_REGION,
         temperature=0.3,
-    )
+    ))
 
     system_prompt = """
     You are the CommunicationAgent for NovaMart customer support.
@@ -1313,11 +1334,11 @@ def build_orchestrator_agent(
     Build the Orchestrator Agent that routes requests and manages WorkflowState.
     """
 
-    model = BedrockModel(
+    model = _apply_guardrail(BedrockModel(
         model_id=config.ORCHESTRATOR_MODEL_ID,
         region_name=config.AWS_REGION,
         temperature=0.0,
-    )
+    ))
 
     system_prompt = """
     You are the OrchestratorAgent for NovaMart customer support.
@@ -1552,21 +1573,26 @@ def build_orchestrator_agent(
     exactly as received. Add absolutely nothing.
     """
 
-    # Each routing tool follows the same pattern:
+    # Each routing tool follows the same read-call-update lifecycle:
     #   1. read the current WorkflowState  (_read_workflow_state)
-    #   2. invoke the worker agent
+    #   2. invoke the worker agent with the current context
     #   3. write its result back with optimistic locking
     #      (_update_workflow_state(session_id, {'<column>': text}, expected_version))
-    # The terminal trace UI can show each step: call trace.step_start('inventory_agent')
-    # before the worker runs and trace.step_done('inventory_agent', old_version) after.
+    # The expected_version used in the update is exactly the version read
+    # before the worker call, so a concurrent update cannot be overwritten
+    # silently: _update_workflow_state retries on a version conflict.
 
-    def _route(
-            agent_name: str,
-            agent,
-            prompt: str,
-            session_id: str,
-        ) -> str:
-        return agent(prompt)
+    def _workflow_context_text(state: Optional[dict]) -> str:
+        """Compact WorkflowState snapshot passed to every worker."""
+        if not state:
+            return "WorkflowState: not found"
+        lines = [f"WorkflowState version: {state.get('version', 0)}"]
+        for key in ('customer_id', 'inventory_agent', 'policy_agent',
+                    'refund_agent', 'communication_agent'):
+            value = state.get(key)
+            if value:
+                lines.append(f"{key}: {value}")
+        return "\n".join(lines)
 
     @tool
     def route_to_inventory_agent(session_id: str, customer_id: str, request: str) -> str:
@@ -1590,7 +1616,31 @@ def build_orchestrator_agent(
             "Report verified facts, including customer tier. "
             "Do not decide eligibility.",
         )
-        return _route("inventory_agent", inventory_agent, prompt, session_id)
+
+        # 1. Read state before the worker call (carries the version we must
+        #    use for the optimistic-locking update below).
+        state = _read_workflow_state(session_id)
+        if not state:
+            raise RuntimeError(
+                f"WorkflowState not found for session {session_id}. "
+                "Call initialize_session before routing to a worker."
+            )
+        expected_version = int(state.get('version', 0))
+        prompt = f"{prompt}\n\n{_workflow_context_text(state)}"
+
+        # 2. Invoke the worker.
+        trace.step_start('inventory_agent')
+        result = inventory_agent(prompt)
+        text = str(result)
+
+        # 3. Persist the result, guarded by the version read before the call.
+        _update_workflow_state(
+            session_id,
+            {'inventory_agent': text},
+            expected_version,
+        )
+        trace.step_done('inventory_agent', expected_version)
+        return text
 
     @tool
     def route_to_policy_agent(session_id: str, request: str) -> str:
@@ -1616,7 +1666,27 @@ def build_orchestrator_agent(
             "sources. Do not make customer-specific eligibility decisions."
             ),
         )
-        return _route("policy_agent", policy_agent, prompt, session_id)
+
+        state = _read_workflow_state(session_id)
+        if not state:
+            raise RuntimeError(
+                f"WorkflowState not found for session {session_id}. "
+                "Call initialize_session before routing to a worker."
+            )
+        expected_version = int(state.get('version', 0))
+        prompt = f"{prompt}\n\n{_workflow_context_text(state)}"
+
+        trace.step_start('policy_agent')
+        result = policy_agent(prompt)
+        text = str(result)
+
+        _update_workflow_state(
+            session_id,
+            {'policy_agent': text},
+            expected_version,
+        )
+        trace.step_done('policy_agent', expected_version)
+        return text
 
     @tool
     def route_to_refund_agent(session_id: str, customer_id: str, request: str) -> str:
@@ -1643,7 +1713,27 @@ def build_orchestrator_agent(
             "Do not execute refunds or modify orders."
             ),
         )
-        return _route("refund_agent", refund_agent, prompt, session_id)
+
+        state = _read_workflow_state(session_id)
+        if not state:
+            raise RuntimeError(
+                f"WorkflowState not found for session {session_id}. "
+                "Call initialize_session before routing to a worker."
+            )
+        expected_version = int(state.get('version', 0))
+        prompt = f"{prompt}\n\n{_workflow_context_text(state)}"
+
+        trace.step_start('refund_agent')
+        result = refund_agent(prompt)
+        text = str(result)
+
+        _update_workflow_state(
+            session_id,
+            {'refund_agent': text},
+            expected_version,
+        )
+        trace.step_done('refund_agent', expected_version)
+        return text
 
     @tool
     def route_to_communication_agent(session_id: str, customer_id: str,
@@ -1672,12 +1762,27 @@ def build_orchestrator_agent(
             "by other agents. Output the message itself without a preamble."
         ),
         )
-        return _route(
-            "communication_agent",
-            communication_agent,
-            prompt,
+
+        state = _read_workflow_state(session_id)
+        if not state:
+            raise RuntimeError(
+                f"WorkflowState not found for session {session_id}. "
+                "Call initialize_session before routing to a worker."
+            )
+        expected_version = int(state.get('version', 0))
+        prompt = f"{prompt}\n\n{_workflow_context_text(state)}"
+
+        trace.step_start('communication_agent')
+        result = communication_agent(prompt)
+        text = str(result)
+
+        _update_workflow_state(
             session_id,
+            {'communication_agent': text},
+            expected_version,
         )
+        trace.step_done('communication_agent', expected_version)
+        return text
 
     @tool
     def initialize_session(session_id: str, customer_id: str) -> str:
@@ -1867,35 +1972,6 @@ def create_guardrail() -> tuple[str, str]:
     return guardrail_id, guardrail_version
 
 
-# Minimal stdlib-only HTTP entry point for the AgentCore Runtime (HTTP protocol
-# contract: GET /ping and POST /invocations on port 8080).
-_RUNTIME_ENTRYPOINT_SOURCE = '''\
-import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-
-class Handler(BaseHTTPRequestHandler):
-    def _send(self, body):
-        data = json.dumps(body).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_GET(self):
-        self._send({"status": "Healthy"})
-
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        self._send({"response": "NovaMart AgentCore Runtime is up"})
-
-
-if __name__ == "__main__":
-    HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
-'''
-
-
 def deploy_to_agentcore_runtime(
     orchestrator_agent: Agent,
     guardrail_id: str,
@@ -1914,70 +1990,22 @@ def deploy_to_agentcore_runtime(
     Returns:
         The AgentCore Runtime ARN
     """
-    runtime_name = f"{config.PROJECT_NAME}-runtime".replace('-', '_')
-    s3_client    = boto3.client('s3', region_name=config.AWS_REGION)
+    import agentcore_cli
 
-    # Check if runtime already exists
-    try:
-        existing = agentcore_control.list_agent_runtimes()
-        for r in existing.get('agentRuntimes', []):
-            if r['agentRuntimeName'] == runtime_name:
-                runtime_arn = r['agentRuntimeArn']
-                if 'FAIL' in r.get('status', ''):
-                    # A runtime stuck in CREATE_FAILED can never become READY -
-                    # delete it and fall through to recreate it.
-                    print(f"  Runtime {runtime_arn} is {r['status']} - deleting it to recreate")
-                    agentcore_control.delete_agent_runtime(agentRuntimeId=r['agentRuntimeId'])
-                    for _ in range(30):
-                        time.sleep(10)
-                        names = [x['agentRuntimeName'] for x in
-                                 agentcore_control.list_agent_runtimes().get('agentRuntimes', [])]
-                        if runtime_name not in names:
-                            break
-                    break
-                print(f"AgentCore Runtime already exists: {runtime_arn}")
-                return runtime_arn
-    except Exception as e:
-        print(f"  [Note] Could not check existing runtimes: {e}")
+    runtime_name = config.AGENTCORE_RUNTIME_NAME
+    print(f"  AWS Account: {config.ACCOUNT_ID}  |  Region: {config.AWS_REGION}")
+    print(f"  Runtime: {runtime_name}  |  CLI project: agentcore/agentcore.json "
+          f"(stack {agentcore_cli.stack_name()})")
+    previous_arn = agentcore_cli.deployed_runtime_arn()
+    if previous_arn:
+        print(f"  Runtime already deployed - updating it: {previous_arn}")
 
-    sts        = boto3.client('sts', region_name=config.AWS_REGION)
-    account_id = sts.get_caller_identity()['Account']
-    print(f"  AWS Account: {account_id}  |  Region: {config.AWS_REGION}")
+    # Stage the code the CLI packages (src modules + config.py + pyproject.toml).
+    agentcore_cli.stage_runtime_code()
 
-    # NOTE: AgentCore API — guardrail injection.
-    # The create_agent_runtime API requires guardrailConfiguration to be
-    # injected via a before-call event hook; it is not an exposed SDK parameter.
-    guardrail_cfg = {
-        'guardrailIdentifier': guardrail_id,
-        'guardrailVersion':    guardrail_version,
-    }
-
-    def _inject_guardrail(params, **kwargs):
-        params['guardrailConfiguration'] = guardrail_cfg
-
-    agentcore_control.meta.events.register(
-        'before-call.bedrock-agentcore-control.CreateAgentRuntime',
-        _inject_guardrail,
-    )
-    print(f"  Guardrail hook registered: {guardrail_id} (v{guardrail_version})")
-
-    # NOTE: AgentCore API — S3 artifact requirement.
-    # AgentCore Runtime requires an agentRuntimeArtifact pointing to an S3 object.
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr('main.py', _RUNTIME_ENTRYPOINT_SOURCE)
-    zip_buffer.seek(0)
-
-    artifact_key = f"agentcore-artifacts/{runtime_name}/deployment.zip"
-    s3_client.put_object(
-        Bucket=config.POLICY_BUCKET,
-        Key=artifact_key,
-        Body=zip_buffer.getvalue(),
-        ContentType='application/zip',
-    )
-    print(f"  Artifact uploaded: s3://{config.POLICY_BUCKET}/{artifact_key}")
-
-
+    # Everything the deployed runtime needs to rebuild the agent graph on the
+    # other side: which KBs to retrieve from, where to log, and which guardrail
+    # version to apply to every agent's model.
     runtime_env = {
         'AWS_REGION':        config.AWS_REGION,
         'PROJECT_NAME':      config.PROJECT_NAME,
@@ -1989,33 +2017,29 @@ def deploy_to_agentcore_runtime(
         'GUARDRAIL_VERSION': guardrail_version,
     }
 
-    response = agentcore_control.create_agent_runtime(
-        agentRuntimeName=runtime_name,
-        description="Multi-RAG Ecommerce",
-        roleArn=config.AGENTCORE_ROLE_ARN,
-        networkConfiguration={
-            "networkMode": "PUBLIC",
-        },
-        protocolConfiguration={
-            "serverProtocol": "HTTP",
-        },
-        agentRuntimeArtifact={
-            "codeConfiguration": {
-                "code": {
-                    "s3": {
-                        "bucket": config.POLICY_BUCKET,
-                        "prefix": artifact_key,
-                    }
-                },
-                "runtime": "PYTHON_3_12",
-                "entryPoint": ["main.py"],
-            }
-        },
-        environmentVariables=runtime_env,
+    missing = [k for k, v in runtime_env.items() if not v]
+    if missing:
+        raise RuntimeError(
+            f"Cannot deploy - these runtime environment variables are empty: "
+            f"{', '.join(missing)}. Create the three Knowledge Bases (Task 5) "
+            f"and the guardrail before deploying."
+        )
+
+    # 1. Configuration: write PUBLIC networking, HTTP protocol and the
+    #    foundation stack's execution role into agentcore/agentcore.json.
+    agentcore_cli.configure_runtime(
+        env_vars=runtime_env,
+        network_mode='PUBLIC',
+        protocol='HTTP',
+        execution_role_arn=config.AGENTCORE_ROLE_ARN,
     )
 
-    runtime_arn = response.get("agentRuntimeArn", response.get("arn", ""))
-    print(f"  Runtime ARN: {runtime_arn}")
+    # 2. Deployment: the CLI packages build/runtime/ and creates or updates
+    #    the runtime through its CDK stack.
+    agentcore_cli.deploy()
+
+    # 3. Result: the ARN recorded by the CLI after deployment.
+    runtime_arn = agentcore_cli.deployed_runtime_arn()
 
     if not runtime_arn:
         raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
@@ -2092,9 +2116,11 @@ def configure_observability(runtime_arn: str) -> None:
     Configure AgentCore Observability:
     - Agent logs → CloudWatch Logs at INFO level
     - Execution traces → AWS X-Ray at 100% sampling
-    """
-    runtime_id = runtime_arn.split('/')[-1]
 
+    Builds the loggingConfiguration and hands it to the pre-written
+    apply_observability_config(), which turns it into real AWS state
+    (log group, Transaction Search and runtime environment variables).
+    """
     logging_configuration = {
         'cloudWatchConfig': {
             'logGroupName': config.AGENT_LOG_GROUP,
@@ -2103,59 +2129,17 @@ def configure_observability(runtime_arn: str) -> None:
         },
         'xRayConfig': {
             'enabled':      True,
-            'samplingRate': 1.0,     
+            'samplingRate': 1.0,
         },
     }
 
-    cw = logging_configuration['cloudWatchConfig']
-    xr = logging_configuration['xRayConfig']
-
     try:
-        # 1. CloudWatch log group
-        try:
-            logs_client.create_log_group(logGroupName=cw['logGroupName'])
-        except logs_client.exceptions.ResourceAlreadyExistsException:
-            pass
-
-        # 2. X-Ray: CloudWatch Transaction Search + 100% indexing
-        search = enable_transaction_search(float(xr['samplingRate']))
-
-        # 3. Runtime environment variables, applied directly with
-        #    update_agent_runtime (no AgentCore CLI needed). The API replaces
-        #    the whole runtime spec, so re-send the current one with the
-        #    observability variables merged into its environment.
-        current = agentcore_control.get_agent_runtime(agentRuntimeId=runtime_id)
-        env = dict(current.get('environmentVariables') or {})
-        env.update({
-            'AGENT_LOG_GROUP':           cw['logGroupName'],
-            'AGENT_LOG_LEVEL':           str(cw['logLevel']).upper(),
-            'AGENT_LOG_TO_CLOUDWATCH':   'true' if cw['enabled'] else 'false',
-            'AGENT_TRACING_ENABLED':     'true' if xr['enabled'] else 'false',
-            'AGENT_TRACE_SAMPLING_RATE': str(float(xr['samplingRate'])),
-        })
-        update = {
-            'agentRuntimeId':       runtime_id,
-            'agentRuntimeArtifact': current['agentRuntimeArtifact'],
-            'roleArn':              current['roleArn'],
-            'networkConfiguration': current['networkConfiguration'],
-            'environmentVariables': env,
-        }
-        for key in ('description', 'protocolConfiguration', 'authorizerConfiguration',
-                    'requestHeaderConfiguration', 'lifecycleConfiguration',
-                    'metadataConfiguration'):
-            if current.get(key):
-                update[key] = current[key]
-        agentcore_control.update_agent_runtime(**update)
-
-        print("  Waiting for runtime status READY", end='', flush=True)
-        wait_for_runtime_ready(agentcore_control, runtime_id)
-        print(' ready.')
-
+        summary = apply_observability_config(runtime_arn, logging_configuration)
         print(f"  CloudWatch Logs : {config.AGENT_LOG_GROUP} (INFO)")
         print(f"  X-Ray tracing   : enabled at "
-              f"{xr['samplingRate']:.0%} sampling")
-        if isinstance(search, dict) and search.get('transactionSearchStatus'):
-            print(f"  Transaction Search: {search['transactionSearchStatus']}")
+              f"{logging_configuration['xRayConfig']['samplingRate']:.0%} sampling")
+        if isinstance(summary, dict) and summary.get('transactionSearchStatus'):
+            print(f"  Transaction Search: {summary['transactionSearchStatus']}")
     except Exception as e:
         print(f"  [Note] Observability configuration failed: {e}")
 
